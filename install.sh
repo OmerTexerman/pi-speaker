@@ -11,7 +11,7 @@ set -euo pipefail
 #   - User-service Wyoming Satellite for Home Assistant Assist
 #   - User-service ducking daemon that lowers music while Wyoming TTS is speaking
 
-SCRIPT_VERSION="2026-05-01.5-clean-audio-chooser"
+SCRIPT_VERSION="2026-05-01.8-resume-raspotify-check"
 
 ROOM_NAME=""
 HA_HOST=""
@@ -25,6 +25,9 @@ SET_SINK_ID=""
 NONINTERACTIVE="0"
 CONFIGURE_INNOMAKER_HAT="1"
 DISABLE_ONBOARD_AUDIO="1"
+AUTO_REBOOT_AFTER_HAT_CONFIG="0"
+RUN_AUDIO_TEST="1"
+ROOM_NODE_STATE_DIR="/var/lib/room-node"
 
 usage() {
   cat <<'USAGE'
@@ -41,8 +44,10 @@ Options:
   --with-bluetooth        Install Bluetooth audio packages and keep Bluetooth enabled
   --keep-wifi             Do not disable Wi-Fi
   --keep-bluetooth        Do not disable Bluetooth
-  --no-innomaker-hat     Do not configure /boot/firmware/config.txt for InnoMaker AMP Pro
-  --keep-onboard-audio   Do not add dtparam=audio=off when configuring the HAT
+  --no-innomaker-hat      Do not configure /boot/firmware/config.txt for InnoMaker AMP Pro
+  --keep-onboard-audio    Do not add dtparam=audio=off when configuring the HAT
+  --auto-reboot           Reboot automatically if HAT boot config changes
+  --no-audio-test         Do not offer the post-install speaker test
   --noninteractive        Do not prompt; require --room and --ha
   -h, --help              Show this help
 
@@ -65,6 +70,8 @@ while [[ $# -gt 0 ]]; do
     --keep-bluetooth) DISABLE_BLUETOOTH="0"; shift ;;
     --no-innomaker-hat) CONFIGURE_INNOMAKER_HAT="0"; shift ;;
     --keep-onboard-audio) DISABLE_ONBOARD_AUDIO="0"; shift ;;
+    --auto-reboot) AUTO_REBOOT_AFTER_HAT_CONFIG="1"; shift ;;
+    --no-audio-test) RUN_AUDIO_TEST="0"; shift ;;
     --noninteractive) NONINTERACTIVE="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1"; usage; exit 1 ;;
@@ -109,6 +116,181 @@ run_as_user() {
 
 userctl() {
   sudo -u "$CURRENT_USER" XDG_RUNTIME_DIR="$USER_RUNTIME" DBUS_SESSION_BUS_ADDRESS="$USER_BUS" systemctl --user "$@"
+}
+
+install_resume_helper() {
+  sudo tee /usr/local/bin/room-node-resume >/dev/null <<'ROOMNODERESUME_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="/var/lib/room-node"
+COMMAND_FILE="${STATE_DIR}/resume-command"
+REASON_FILE="${STATE_DIR}/resume-reason"
+
+if [[ ! -s "$COMMAND_FILE" ]]; then
+  echo "No pending room-node install resume command found."
+  exit 1
+fi
+
+if [[ -s "$REASON_FILE" ]]; then
+  echo "Pending room-node install:"
+  sed 's/^/  /' "$REASON_FILE"
+  echo
+fi
+
+echo "Running saved resume command:"
+sed 's/^/  /' "$COMMAND_FILE"
+echo
+
+exec bash -lc "$(cat "$COMMAND_FILE")"
+ROOMNODERESUME_EOF
+  sudo chmod +x /usr/local/bin/room-node-resume
+}
+
+script_path() {
+  readlink -f "$0" 2>/dev/null || printf '%s\n' "$0"
+}
+
+rerun_command() {
+  local args=(
+    --room "$ROOM_NAME"
+    --ha "$HA_HOST"
+    --duck "$DUCK_LEVEL"
+  )
+  [[ -n "$MIC_DEVICE" ]] && args+=(--mic-device "$MIC_DEVICE")
+  [[ -n "$SET_SINK_ID" ]] && args+=(--sink-id "$SET_SINK_ID")
+  [[ "$INSTALL_AIRPLAY" == "0" ]] && args+=(--no-airplay)
+  [[ "$INSTALL_BLUETOOTH" == "1" ]] && args+=(--with-bluetooth)
+  [[ "$DISABLE_WIFI" == "0" ]] && args+=(--keep-wifi)
+  [[ "$DISABLE_BLUETOOTH" == "0" ]] && args+=(--keep-bluetooth)
+  [[ "$CONFIGURE_INNOMAKER_HAT" == "0" ]] && args+=(--no-innomaker-hat)
+  [[ "$DISABLE_ONBOARD_AUDIO" == "0" ]] && args+=(--keep-onboard-audio)
+  [[ "$RUN_AUDIO_TEST" == "0" ]] && args+=(--no-audio-test)
+  [[ "$NONINTERACTIVE" == "1" ]] && args+=(--noninteractive)
+
+  printf 'sudo %q' "$(script_path)"
+  printf ' %q' "${args[@]}"
+  printf '\n'
+}
+
+write_resume_state() {
+  local reason="$1"
+  local tmp_command tmp_reason
+
+  install_resume_helper
+  tmp_command="$(mktemp)"
+  tmp_reason="$(mktemp)"
+  printf '%s\n' "$(rerun_command)" >"$tmp_command"
+  printf '%s\n' "$reason" >"$tmp_reason"
+
+  sudo mkdir -p "$ROOM_NODE_STATE_DIR"
+  sudo install -o root -g root -m 0644 "$tmp_command" "${ROOM_NODE_STATE_DIR}/resume-command"
+  sudo install -o root -g root -m 0644 "$tmp_reason" "${ROOM_NODE_STATE_DIR}/resume-reason"
+  rm -f "$tmp_command" "$tmp_reason"
+}
+
+clear_resume_state() {
+  sudo rm -f "${ROOM_NODE_STATE_DIR}/resume-command" "${ROOM_NODE_STATE_DIR}/resume-reason" 2>/dev/null || true
+}
+
+merus_card_present() {
+  if [[ -r /proc/asound/cards ]] && grep -Eqi 'snd_rpi_merus_amp|merus|ma120|innomaker|amp pro' /proc/asound/cards; then
+    return 0
+  fi
+  if command -v aplay >/dev/null 2>&1 && aplay -l 2>/dev/null | grep -Eqi 'snd_rpi_merus_amp|merus|ma120|innomaker|amp pro'; then
+    return 0
+  fi
+  return 1
+}
+
+write_innomaker_boot_config() {
+  local boot_config="$1"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk '
+    BEGIN { skip=0; pending_blank="" }
+    function emit(line) {
+      printf "%s%s\n", pending_blank, line
+      pending_blank=""
+    }
+    /^# room-node: BEGIN managed InnoMaker AMP Pro audio$/ { skip=1; pending_blank=""; next }
+    /^# room-node: END managed InnoMaker AMP Pro audio$/ { skip=0; pending_blank=""; next }
+    skip { next }
+    /^[[:space:]]*$/ { pending_blank = pending_blank $0 "\n"; next }
+    /^[[:space:]]*dtoverlay=merus-amp[[:space:]]*(#.*)?$/ {
+      emit("# room-node moved into managed [all] block: " $0)
+      next
+    }
+    /^[[:space:]]*dtparam=audio=off[[:space:]]*(#.*)?$/ {
+      emit("# room-node moved into managed [all] block: " $0)
+      next
+    }
+    { emit($0) }
+  ' "$boot_config" >"$tmp"
+
+  {
+    echo ""
+    echo "# room-node: BEGIN managed InnoMaker AMP Pro audio"
+    echo "[all]"
+    if [[ "$DISABLE_ONBOARD_AUDIO" == "1" ]]; then
+      echo "# Disable Pi PWM/headphone audio so the I2S amplifier becomes the only local playback card."
+      echo "dtparam=audio=off"
+    else
+      echo "# dtparam=audio=off intentionally omitted by --keep-onboard-audio."
+    fi
+    echo "# InnoMaker HIFI AMP PRO / Infineon MERUS MA12070P."
+    echo "dtoverlay=merus-amp"
+    echo "# room-node: END managed InnoMaker AMP Pro audio"
+  } >>"$tmp"
+
+  if sudo cmp -s "$boot_config" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  sudo cp "$boot_config" "${boot_config}.room-node.bak.$(date +%Y%m%d-%H%M%S)" || true
+  sudo install -o root -g root -m 0644 "$tmp" "$boot_config"
+  rm -f "$tmp"
+  return 0
+}
+
+reboot_or_stop_for_hat() {
+  local reason="$1"
+  write_resume_state "$reason"
+  echo
+  echo "$reason"
+  echo "The InnoMaker/MERUS ALSA card is created by firmware at boot, so it will not show up in PipeWire sink selection until after a reboot."
+  echo
+  echo "After reboot, rerun:"
+  echo "  $(rerun_command)"
+  echo "Or run:"
+  echo "  sudo room-node-resume"
+  echo
+
+  if [[ "$AUTO_REBOOT_AFTER_HAT_CONFIG" == "1" ]]; then
+    echo "Rebooting now because --auto-reboot was set."
+    sudo reboot
+    exit 0
+  fi
+
+  if [[ "$NONINTERACTIVE" == "1" || ! -t 0 ]]; then
+    echo "Stopping before audio setup so the next run can see the HAT."
+    exit 0
+  fi
+
+  local answer
+  read -rp "Reboot now before choosing audio devices? [Y/n]: " answer
+  case "$answer" in
+    n|N|no|NO|No)
+      echo "Stopping before audio setup. Reboot manually, then rerun the command above."
+      exit 0
+      ;;
+    *)
+      sudo reboot
+      exit 0
+      ;;
+  esac
 }
 
 log "Room node installer ${SCRIPT_VERSION}"
@@ -159,39 +341,16 @@ if [[ "$CONFIGURE_INNOMAKER_HAT" == "1" ]]; then
   if [[ ! -f "$BOOT_CONFIG" ]]; then
     echo "WARNING: could not find /boot/firmware/config.txt or /boot/config.txt; skipping HAT overlay."
   else
-    sudo cp "$BOOT_CONFIG" "${BOOT_CONFIG}.room-node.bak.$(date +%Y%m%d-%H%M%S)" || true
-
-    HAT_CHANGED="0"
-
-    if [[ "$DISABLE_ONBOARD_AUDIO" == "1" ]]; then
-      if ! grep -Fxq "dtparam=audio=off" "$BOOT_CONFIG"; then
-        echo "Adding dtparam=audio=off to disable the Pi's built-in PWM audio."
-        {
-          echo ""
-          echo "# room-node: prefer external I2S AMP HAT"
-          echo "dtparam=audio=off"
-        } | sudo tee -a "$BOOT_CONFIG" >/dev/null
-        HAT_CHANGED="1"
+    if write_innomaker_boot_config "$BOOT_CONFIG"; then
+      echo "Installed managed [all] boot config block for dtoverlay=merus-amp."
+      if ! merus_card_present; then
+        reboot_or_stop_for_hat "HAT boot config changed and the Merus-Amp card is not visible in this boot."
       fi
-    fi
-
-    if ! grep -Fxq "dtoverlay=merus-amp" "$BOOT_CONFIG"; then
-      echo "Adding dtoverlay=merus-amp for InnoMaker AMP Pro / MERUS MA12070P."
-      {
-        echo "# room-node: InnoMaker AMP Pro / MERUS MA12070P"
-        echo "dtoverlay=merus-amp"
-      } | sudo tee -a "$BOOT_CONFIG" >/dev/null
-      HAT_CHANGED="1"
     else
-      echo "dtoverlay=merus-amp already present."
-    fi
-
-    if [[ "$HAT_CHANGED" == "1" ]]; then
-      echo
-      echo "NOTE: HAT overlay changes require a reboot before the Merus-Amp audio device appears."
-      echo "The installer will continue, but if the HAT is not visible in wpctl/aplay yet, reboot and rerun:"
-      echo "  ./install.sh --room \"${ROOM_NAME}\" --ha \"${HA_HOST}\""
-      echo
+      echo "Managed dtoverlay=merus-amp boot config already present."
+      if ! merus_card_present; then
+        reboot_or_stop_for_hat "The Merus-Amp card is still not visible. If this Pi has not rebooted since the overlay was added, reboot first."
+      fi
     fi
   fi
 else
@@ -252,21 +411,33 @@ set -euo pipefail
 
 # Tries to make the InnoMaker/MERUS AMP HAT the PipeWire default sink.
 # Safe to run repeatedly. If the HAT is not visible yet, it exits without failing.
-PREFERRED_RE="${ROOM_PREFERRED_SINK_REGEX:-Merus|MERUS|MA12070|InnoMaker|innomaker|AMP Pro|Amp Pro}"
+PREFERRED_RE="${ROOM_PREFERRED_SINK_REGEX:-Merus|MERUS|MA120|ma120|snd_rpi_merus_amp|InnoMaker|innomaker|AMP Pro|Amp Pro|pihat|piHat}"
 TRIES="${ROOM_AUDIO_DEFAULT_TRIES:-30}"
 
 for _ in $(seq 1 "$TRIES"); do
   STATUS="$(wpctl status 2>/dev/null || true)"
-  ID="$(printf '%s\n' "$STATUS" | awk -v re="$PREFERRED_RE" '
-    BEGIN { IGNORECASE=1 }
-    $0 ~ re {
-      if (match($0, /[0-9]+\./)) {
-        id = substr($0, RSTART, RLENGTH - 1)
-        print id
-        exit
-      }
+  ID=""
+
+  while IFS=$'\t' read -r SINK_ID SINK_LINE; do
+    [[ -z "${SINK_ID:-}" ]] && continue
+    INSPECT="$(wpctl inspect "$SINK_ID" 2>/dev/null || true)"
+    if printf '%s\n%s\n' "$SINK_LINE" "$INSPECT" | grep -Eiq "$PREFERRED_RE"; then
+      ID="$SINK_ID"
+      break
+    fi
+  done < <(printf '%s\n' "$STATUS" | awk '
+    BEGIN { in_audio=0; in_sinks=0 }
+    /^Audio$/ { in_audio=1; next }
+    /^Video$/ { in_audio=0; in_sinks=0; next }
+    in_audio && /Sinks:/ { in_sinks=1; next }
+    in_audio && /Sources:/ { in_sinks=0; next }
+    in_audio && /Filters:/ { in_sinks=0; next }
+    in_audio && /Streams:/ { in_sinks=0; next }
+    in_sinks && match($0, /[0-9]+\./) {
+      id = substr($0, RSTART, RLENGTH - 1)
+      print id "\t" $0
     }
-  ')"
+  ')
 
   if [[ -n "${ID:-}" ]]; then
     echo "Setting default PipeWire sink to ID ${ID} matching ${PREFERRED_RE}"
@@ -278,7 +449,12 @@ for _ in $(seq 1 "$TRIES"); do
   sleep 1
 done
 
-echo "Preferred InnoMaker/MERUS sink not found. Leaving PipeWire default unchanged."
+echo "Preferred InnoMaker/MERUS PipeWire sink not found. Leaving PipeWire default unchanged."
+if [[ -r /proc/asound/cards ]] && grep -Eqi 'snd_rpi_merus_amp|merus|ma120|innomaker|amp pro' /proc/asound/cards; then
+  echo "Merus ALSA card is present, but WirePlumber has not exposed a matching sink yet."
+else
+  echo "Merus ALSA card is not present. Confirm dtoverlay=merus-amp is active and rebooted."
+fi
 exit 0
 ROOMAUDIODEFAULT_EOF
 sudo chmod +x /usr/local/bin/room-audio-default
@@ -303,6 +479,16 @@ if command -v wpctl >/dev/null 2>&1; then
   '
 else
   echo "  wpctl not installed/running yet."
+fi
+
+echo
+echo "=== INNOMAKER AMP PRO / ALSA PLAYBACK CARD ==="
+if [[ -r /proc/asound/cards ]] && grep -Eqi 'snd_rpi_merus_amp|merus|ma120|innomaker|amp pro' /proc/asound/cards; then
+  grep -Ei 'snd_rpi_merus_amp|merus|ma120|innomaker|amp pro' /proc/asound/cards | sed 's/^/  /'
+elif command -v aplay >/dev/null 2>&1 && aplay -l 2>/dev/null | grep -Eqi 'snd_rpi_merus_amp|merus|ma120|innomaker|amp pro'; then
+  aplay -l 2>/dev/null | grep -Ei 'snd_rpi_merus_amp|merus|ma120|innomaker|amp pro' | sed 's/^/  /'
+else
+  echo "  Not visible. If dtoverlay=merus-amp was just added, reboot before selecting a speaker sink."
 fi
 
 echo
@@ -336,6 +522,53 @@ echo "  Video: camera/codec stuff, irrelevant."
 echo "  Sources from wpctl: PipeWire capture nodes; useful diagnostically, but this script asks for ALSA mic strings from arecord."
 ROOMAUDIOLS_EOF
 sudo chmod +x /usr/local/bin/room-audio-ls
+
+sudo tee /usr/local/bin/room-audio-test >/dev/null <<'ROOMAUDIOTEST_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DURATION_SECONDS="${1:-2.0}"
+WAV_FILE="$(mktemp --suffix=.wav)"
+trap 'rm -f "$WAV_FILE"' EXIT
+
+python3 - "$WAV_FILE" "$DURATION_SECONDS" <<'PY'
+import math
+import struct
+import sys
+import wave
+
+path = sys.argv[1]
+duration = float(sys.argv[2])
+rate = 48000
+amplitude = 0.22
+samples = int(rate * duration)
+notes = (440.0, 660.0, 880.0)
+
+with wave.open(path, "wb") as wav:
+    wav.setnchannels(1)
+    wav.setsampwidth(2)
+    wav.setframerate(rate)
+    frames = bytearray()
+    for i in range(samples):
+        note = notes[min(len(notes) - 1, int(i / max(1, samples / len(notes))))]
+        envelope = min(1.0, i / (rate * 0.03), (samples - i) / (rate * 0.04))
+        value = int(32767 * amplitude * envelope * math.sin(2 * math.pi * note * i / rate))
+        frames.extend(struct.pack("<h", value))
+    wav.writeframes(frames)
+PY
+
+if command -v pw-play >/dev/null 2>&1; then
+  exec pw-play "$WAV_FILE"
+elif command -v paplay >/dev/null 2>&1; then
+  exec paplay "$WAV_FILE"
+elif command -v aplay >/dev/null 2>&1; then
+  exec aplay -D default "$WAV_FILE"
+else
+  echo "ERROR: no supported playback command found: pw-play, paplay, or aplay."
+  exit 1
+fi
+ROOMAUDIOTEST_EOF
+sudo chmod +x /usr/local/bin/room-audio-test
 
 sudo tee /usr/local/bin/room-mic-auto >/dev/null <<'ROOMMICAUTO_EOF'
 #!/usr/bin/env bash
@@ -371,7 +604,7 @@ Wants=pipewire.service pipewire-pulse.service wireplumber.service
 
 [Service]
 Type=oneshot
-Environment="ROOM_PREFERRED_SINK_REGEX=Merus|MERUS|MA12070|InnoMaker|innomaker|AMP Pro|Amp Pro"
+Environment="ROOM_PREFERRED_SINK_REGEX=Merus|MERUS|MA120|ma120|snd_rpi_merus_amp|InnoMaker|innomaker|AMP Pro|Amp Pro|pihat|piHat"
 ExecStart=/usr/local/bin/room-audio-default
 RemainAfterExit=yes
 
@@ -415,7 +648,23 @@ fi
 
 log "Install Raspotify package for prebuilt librespot"
 sudo apt-get -y install curl
-curl -sL https://dtcooper.github.io/raspotify/install.sh | sh
+RASPOTIFY_INSTALLER="$(mktemp --suffix=.raspotify-install.sh)"
+if ! curl -fsSL https://dtcooper.github.io/raspotify/install.sh -o "$RASPOTIFY_INSTALLER"; then
+  rm -f "$RASPOTIFY_INSTALLER"
+  echo "ERROR: Failed to download Raspotify installer."
+  exit 1
+fi
+if ! grep -Eq 'raspotify|librespot|apt' "$RASPOTIFY_INSTALLER"; then
+  rm -f "$RASPOTIFY_INSTALLER"
+  echo "ERROR: Downloaded Raspotify installer did not look valid; refusing to execute it."
+  exit 1
+fi
+if ! sh "$RASPOTIFY_INSTALLER"; then
+  rm -f "$RASPOTIFY_INSTALLER"
+  echo "ERROR: Raspotify installer failed."
+  exit 1
+fi
+rm -f "$RASPOTIFY_INSTALLER"
 sudo systemctl disable --now raspotify.service >/dev/null 2>&1 || true
 
 LIBRESPOT_BIN="$(command -v librespot || true)"
@@ -686,6 +935,8 @@ sudo install -o "$CURRENT_USER" -g "$USER_GROUP" -m 0644 /tmp/room-ducker.servic
 rm -f /tmp/room-ducker.service
 
 log "Create helper commands"
+install_resume_helper
+
 AIRPLAY_START_LINE=""
 AIRPLAY_STOP_SERVICE=""
 AIRPLAY_STATUS_SERVICE=""
@@ -768,6 +1019,16 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=\${XDG_RUNTIME_DIR}/bus"
 echo "=== room-node config ==="
 cat /etc/room-node.conf 2>/dev/null || true
 echo
+echo "=== pending room-node resume state ==="
+if [[ -s /var/lib/room-node/resume-command ]]; then
+  echo "Reason:"
+  sed 's/^/  /' /var/lib/room-node/resume-reason 2>/dev/null || true
+  echo "Command:"
+  sed 's/^/  /' /var/lib/room-node/resume-command
+else
+  echo "No pending resume state."
+fi
+echo
 echo "=== hostname ==="
 hostnamectl || true
 echo
@@ -777,8 +1038,15 @@ echo
 echo "=== throttling / undervoltage ==="
 vcgencmd get_throttled 2>/dev/null || true
 echo
+echo "=== OS / kernel ==="
+cat /etc/os-release 2>/dev/null || true
+uname -a || true
+echo
 echo "=== clean audio summary ==="
 /usr/local/bin/room-audio-ls 2>/dev/null || true
+echo
+echo "=== /proc/asound/cards ==="
+cat /proc/asound/cards 2>/dev/null || true
 echo
 echo "=== ALSA capture devices - full raw list ==="
 arecord -L || true
@@ -789,8 +1057,30 @@ echo
 echo "=== ALSA cards ==="
 aplay -l || true
 echo
-echo "=== InnoMaker/Merus boot config ==="
-grep -nE "merus-amp|dtparam=audio=off" /boot/firmware/config.txt /boot/config.txt 2>/dev/null || true
+echo "=== InnoMaker/Merus boot config snippets ==="
+for config_file in /boot/firmware/config.txt /boot/config.txt; do
+  if [[ -f "\$config_file" ]]; then
+    echo "--- \${config_file} ---"
+    grep -nE "\\[|room-node|merus-amp|dtparam=audio|dtoverlay|i2s" "\$config_file" 2>/dev/null || true
+  fi
+done
+echo
+echo "=== loaded device-tree overlays ==="
+dtoverlay -l 2>/dev/null || true
+echo
+echo "=== firmware config strings relevant to audio/overlays ==="
+vcgencmd get_config str 2>/dev/null | grep -Ei "overlay|audio|i2s|dtparam|merus|ma120" || true
+echo
+echo "=== firmware config ints relevant to audio/overlays ==="
+vcgencmd get_config int 2>/dev/null | grep -Ei "audio|i2s|dtparam" || true
+echo
+echo "=== kernel log audio / overlay lines ==="
+{
+  sudo -n dmesg 2>/dev/null || dmesg 2>/dev/null || true
+} | grep -Ei "merus|ma120|snd|asoc|i2s|audio|dtoverlay|device tree|dtparam" | tail -n 200 || true
+echo
+echo "=== firmware boot log audio / overlay lines ==="
+vclog --msg 2>/dev/null | grep -Ei "merus|ma120|snd|asoc|i2s|audio|dtoverlay|device tree|dtparam|failed|error" | tail -n 200 || true
 echo
 echo "=== PipeWire status ==="
 sudo -u "\${USER_NAME}" XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR}" DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS}" wpctl status || true
@@ -829,6 +1119,45 @@ else
   echo "WARNING: user bus unavailable; reboot, then run: audio-mode status"
 fi
 
+clear_resume_state
+
+log "Post-install audio test"
+if [[ "$RUN_AUDIO_TEST" != "1" ]]; then
+  echo "Skipping speaker test because --no-audio-test was set."
+elif [[ "$NONINTERACTIVE" == "1" ]]; then
+  echo "Skipping interactive speaker test in --noninteractive mode."
+  echo "After reboot/setup, run: room-audio-test"
+elif [[ ! -S "${USER_RUNTIME}/bus" ]]; then
+  echo "Skipping speaker test because the user PipeWire bus is not available."
+  echo "After reboot, run: room-audio-test"
+else
+  echo "This plays a short three-note tone through the current default speaker sink."
+  echo "If the HAT was just configured, this should only run after the reboot gate above has passed."
+  read -rp "Play speaker test now? [Y/n]: " AUDIO_TEST_ANSWER
+  case "$AUDIO_TEST_ANSWER" in
+    n|N|no|NO|No)
+      echo "Speaker test skipped. Run later with: room-audio-test"
+      ;;
+    *)
+      run_as_user '/usr/local/bin/room-audio-default || true'
+      if run_as_user '/usr/local/bin/room-audio-test'; then
+        read -rp "Did you hear the tone from the amplifier speakers? [Y/n]: " AUDIO_TEST_HEARD
+        case "$AUDIO_TEST_HEARD" in
+          n|N|no|NO|No)
+            echo "Run room-node-diag and check the InnoMaker/Merus sections before using this room."
+            echo "Common causes: HAT not rebooted after overlay, HAT not powered correctly, or PipeWire did not expose the Merus sink."
+            ;;
+          *)
+            echo "Speaker test confirmed."
+            ;;
+        esac
+      else
+        echo "Speaker test failed. Run room-node-diag for detailed audio/HAT diagnostics."
+      fi
+      ;;
+  esac
+fi
+
 log "Install complete"
 echo "Spotify Connect target: ${ROOM_NAME}"
 if [[ "$INSTALL_AIRPLAY" == "1" ]]; then echo "AirPlay target:         ${ROOM_NAME} AirPlay"; fi
@@ -842,6 +1171,8 @@ echo "  audio-mode airplay       # AirPlay only"
 echo "  audio-mode all           # allow all sources to mix"
 echo "  audio-mode status"
 echo "  room-audio-default      # retry setting default sink to the Merus/InnoMaker HAT"
+echo "  room-audio-test         # play a short test tone through the default speaker"
+echo "  room-node-resume        # continue after the HAT reboot gate if pending"
 echo "  room-node-diag"
 echo
 echo "Home Assistant: Settings -> Devices & services -> add/accept Wyoming Protocol for this satellite."
