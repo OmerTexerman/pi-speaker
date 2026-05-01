@@ -11,7 +11,7 @@ set -euo pipefail
 #   - User-service Wyoming Satellite for Home Assistant Assist
 #   - User-service ducking daemon that lowers music while Wyoming TTS is speaking
 
-SCRIPT_VERSION="2026-05-01.3-no-local-vad"
+SCRIPT_VERSION="2026-05-01.5-clean-audio-chooser"
 
 ROOM_NAME=""
 HA_HOST=""
@@ -23,6 +23,8 @@ DISABLE_BLUETOOTH="1"
 MIC_DEVICE=""
 SET_SINK_ID=""
 NONINTERACTIVE="0"
+CONFIGURE_INNOMAKER_HAT="1"
+DISABLE_ONBOARD_AUDIO="1"
 
 usage() {
   cat <<'USAGE'
@@ -39,6 +41,8 @@ Options:
   --with-bluetooth        Install Bluetooth audio packages and keep Bluetooth enabled
   --keep-wifi             Do not disable Wi-Fi
   --keep-bluetooth        Do not disable Bluetooth
+  --no-innomaker-hat     Do not configure /boot/firmware/config.txt for InnoMaker AMP Pro
+  --keep-onboard-audio   Do not add dtparam=audio=off when configuring the HAT
   --noninteractive        Do not prompt; require --room and --ha
   -h, --help              Show this help
 
@@ -59,6 +63,8 @@ while [[ $# -gt 0 ]]; do
     --with-bluetooth) INSTALL_BLUETOOTH="1"; DISABLE_BLUETOOTH="0"; shift ;;
     --keep-wifi) DISABLE_WIFI="0"; shift ;;
     --keep-bluetooth) DISABLE_BLUETOOTH="0"; shift ;;
+    --no-innomaker-hat) CONFIGURE_INNOMAKER_HAT="0"; shift ;;
+    --keep-onboard-audio) DISABLE_ONBOARD_AUDIO="0"; shift ;;
     --noninteractive) NONINTERACTIVE="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1"; usage; exit 1 ;;
@@ -113,6 +119,7 @@ echo "Linux user:        ${CURRENT_USER}"
 echo "Duck level:        ${DUCK_LEVEL}%"
 echo "AirPlay:           ${INSTALL_AIRPLAY}"
 echo "Bluetooth audio:   ${INSTALL_BLUETOOTH}"
+echo "InnoMaker AMP Pro: ${CONFIGURE_INNOMAKER_HAT}"
 
 log "Network sanity check"
 if getent hosts "$HA_HOST" >/dev/null 2>&1; then
@@ -136,6 +143,60 @@ log "Radio power options"
 if [[ "$DISABLE_WIFI" == "1" ]]; then sudo rfkill block wifi || true; fi
 if [[ "$DISABLE_BLUETOOTH" == "1" ]]; then sudo rfkill block bluetooth || true; fi
 sudo raspi-config nonint do_wifi_country US >/dev/null 2>&1 || true
+
+
+log "InnoMaker AMP Pro / MA12070P HAT boot config"
+# Official InnoMaker AMP Pro setup for Raspberry Pi OS Lite is:
+#   dtoverlay=merus-amp
+# The board powers the Raspberry Pi from its own DC input, so do not also power
+# the Pi through USB-C/micro-USB while the HAT is powered.
+if [[ "$CONFIGURE_INNOMAKER_HAT" == "1" ]]; then
+  BOOT_CONFIG="/boot/firmware/config.txt"
+  if [[ ! -f "$BOOT_CONFIG" ]]; then
+    BOOT_CONFIG="/boot/config.txt"
+  fi
+
+  if [[ ! -f "$BOOT_CONFIG" ]]; then
+    echo "WARNING: could not find /boot/firmware/config.txt or /boot/config.txt; skipping HAT overlay."
+  else
+    sudo cp "$BOOT_CONFIG" "${BOOT_CONFIG}.room-node.bak.$(date +%Y%m%d-%H%M%S)" || true
+
+    HAT_CHANGED="0"
+
+    if [[ "$DISABLE_ONBOARD_AUDIO" == "1" ]]; then
+      if ! grep -Fxq "dtparam=audio=off" "$BOOT_CONFIG"; then
+        echo "Adding dtparam=audio=off to disable the Pi's built-in PWM audio."
+        {
+          echo ""
+          echo "# room-node: prefer external I2S AMP HAT"
+          echo "dtparam=audio=off"
+        } | sudo tee -a "$BOOT_CONFIG" >/dev/null
+        HAT_CHANGED="1"
+      fi
+    fi
+
+    if ! grep -Fxq "dtoverlay=merus-amp" "$BOOT_CONFIG"; then
+      echo "Adding dtoverlay=merus-amp for InnoMaker AMP Pro / MERUS MA12070P."
+      {
+        echo "# room-node: InnoMaker AMP Pro / MERUS MA12070P"
+        echo "dtoverlay=merus-amp"
+      } | sudo tee -a "$BOOT_CONFIG" >/dev/null
+      HAT_CHANGED="1"
+    else
+      echo "dtoverlay=merus-amp already present."
+    fi
+
+    if [[ "$HAT_CHANGED" == "1" ]]; then
+      echo
+      echo "NOTE: HAT overlay changes require a reboot before the Merus-Amp audio device appears."
+      echo "The installer will continue, but if the HAT is not visible in wpctl/aplay yet, reboot and rerun:"
+      echo "  ./install.sh --room \"${ROOM_NAME}\" --ha \"${HA_HOST}\""
+      echo
+    fi
+  fi
+else
+  echo "Skipping InnoMaker HAT boot overlay config."
+fi
 
 log "Apt update + base packages"
 sudo apt update
@@ -183,6 +244,143 @@ ctl.!default {
 }
 ASOUNDRC_EOF
 
+
+log "Install Merus/InnoMaker default-output helper"
+sudo tee /usr/local/bin/room-audio-default >/dev/null <<'ROOMAUDIODEFAULT_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Tries to make the InnoMaker/MERUS AMP HAT the PipeWire default sink.
+# Safe to run repeatedly. If the HAT is not visible yet, it exits without failing.
+PREFERRED_RE="${ROOM_PREFERRED_SINK_REGEX:-Merus|MERUS|MA12070|InnoMaker|innomaker|AMP Pro|Amp Pro}"
+TRIES="${ROOM_AUDIO_DEFAULT_TRIES:-30}"
+
+for _ in $(seq 1 "$TRIES"); do
+  STATUS="$(wpctl status 2>/dev/null || true)"
+  ID="$(printf '%s\n' "$STATUS" | awk -v re="$PREFERRED_RE" '
+    BEGIN { IGNORECASE=1 }
+    $0 ~ re {
+      if (match($0, /[0-9]+\./)) {
+        id = substr($0, RSTART, RLENGTH - 1)
+        print id
+        exit
+      }
+    }
+  ')"
+
+  if [[ -n "${ID:-}" ]]; then
+    echo "Setting default PipeWire sink to ID ${ID} matching ${PREFERRED_RE}"
+    wpctl set-default "$ID" || true
+    wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.75 || true
+    exit 0
+  fi
+
+  sleep 1
+done
+
+echo "Preferred InnoMaker/MERUS sink not found. Leaving PipeWire default unchanged."
+exit 0
+ROOMAUDIODEFAULT_EOF
+sudo chmod +x /usr/local/bin/room-audio-default
+
+log "Install clean audio chooser helpers"
+sudo tee /usr/local/bin/room-audio-ls >/dev/null <<'ROOMAUDIOLS_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== SPEAKER OUTPUTS / PipeWire Sinks ==="
+echo "Use these IDs ONLY for the 'default speaker output' question."
+if command -v wpctl >/dev/null 2>&1; then
+  wpctl status 2>/dev/null | awk '
+    BEGIN { in_audio=0; in_sinks=0 }
+    /^Audio$/ { in_audio=1; next }
+    /^Video$/ { in_audio=0; in_sinks=0; next }
+    in_audio && /Sinks:/ { in_sinks=1; next }
+    in_audio && /Sources:/ { in_sinks=0; next }
+    in_audio && /Filters:/ { in_sinks=0; next }
+    in_audio && /Streams:/ { in_sinks=0; next }
+    in_sinks && match($0, /[0-9]+\./) { print "  " $0 }
+  '
+else
+  echo "  wpctl not installed/running yet."
+fi
+
+echo
+echo "=== MICROPHONES / ALSA capture device strings ==="
+echo "Use these full strings ONLY for the Wyoming mic question."
+echo "Prefer plughw:... over hw:... because plughw can do format conversion."
+if command -v arecord >/dev/null 2>&1; then
+  arecord -L 2>/dev/null | awk '
+    BEGIN { last="" }
+    /^[A-Za-z0-9_:-]+(,DEV=[0-9]+)?$/ {
+      last=$0
+      next
+    }
+    /^[[:space:]]/ {
+      desc=$0
+      l=tolower(last " " desc)
+      if (last ~ /^(plughw|hw|sysdefault):/ || l ~ /(respeaker|xvf|arrayuac|seeed|usb|microphone|mic)/) {
+        print "  " last "  --" desc
+      }
+      next
+    }
+  ' | awk '!seen[$0]++'
+else
+  echo "  arecord not installed."
+fi
+
+echo
+echo "=== IGNORE THESE HERE ==="
+echo "  Audio > Devices: hardware cards, not what you pick for default playback."
+echo "  Video: camera/codec stuff, irrelevant."
+echo "  Sources from wpctl: PipeWire capture nodes; useful diagnostically, but this script asks for ALSA mic strings from arecord."
+ROOMAUDIOLS_EOF
+sudo chmod +x /usr/local/bin/room-audio-ls
+
+sudo tee /usr/local/bin/room-mic-auto >/dev/null <<'ROOMMICAUTO_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Return the best-looking ALSA capture device for a USB ReSpeaker/XVF/Array mic.
+# Prefer plughw so arecord can get 16 kHz mono even if hardware exposes another native format.
+arecord -L 2>/dev/null | awk '
+  /^[A-Za-z0-9_:-]+(,DEV=[0-9]+)?$/ {
+    dev=$0
+    getline desc
+    l=tolower(dev " " desc)
+    score=0
+    if (dev ~ /^plughw:/) score += 100
+    if (dev ~ /^hw:/) score += 50
+    if (l ~ /respeaker/) score += 1000
+    if (l ~ /xvf/) score += 900
+    if (l ~ /arrayuac/) score += 800
+    if (l ~ /seeed/) score += 700
+    if (l ~ /4-mic|4 mic|mic array|microphone/) score += 300
+    if (l ~ /usb/) score += 100
+    if (score > 0) print score "\t" dev
+  }
+' | sort -rn | head -n 1 | cut -f2-
+ROOMMICAUTO_EOF
+sudo chmod +x /usr/local/bin/room-mic-auto
+
+cat > /tmp/room-audio-default.service <<AUDIODEFAULTSVC_EOF
+[Unit]
+Description=Set preferred audio output for InnoMaker AMP Pro (${ROOM_NAME})
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service pipewire-pulse.service wireplumber.service
+
+[Service]
+Type=oneshot
+Environment="ROOM_PREFERRED_SINK_REGEX=Merus|MERUS|MA12070|InnoMaker|innomaker|AMP Pro|Amp Pro"
+ExecStart=/usr/local/bin/room-audio-default
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
+AUDIODEFAULTSVC_EOF
+sudo install -o "$CURRENT_USER" -g "$USER_GROUP" -m 0644 /tmp/room-audio-default.service "${USER_SYSTEMD_DIR}/room-audio-default.service"
+rm -f /tmp/room-audio-default.service
+
 log "Start PipeWire user services"
 if [[ -S "${USER_RUNTIME}/bus" ]]; then
   userctl daemon-reload || true
@@ -193,14 +391,22 @@ fi
 sleep 2
 
 if [[ -S "${USER_RUNTIME}/bus" ]]; then
-  echo "Current PipeWire status:"
-  run_as_user 'wpctl status || true'
+  userctl daemon-reload || true
+  userctl enable --now room-audio-default.service || true
+  run_as_user '/usr/local/bin/room-audio-default || true'
 fi
+
+log "Clean audio chooser"
+echo "The installer already tried to auto-select the InnoMaker/MERUS AMP HAT."
+echo "Only choose a speaker ID if that auto-selection is wrong."
+echo
+run_as_user '/usr/local/bin/room-audio-ls || true'
 
 if [[ -z "$SET_SINK_ID" && "$NONINTERACTIVE" != "1" && -S "${USER_RUNTIME}/bus" ]]; then
   echo
-  echo "If the default audio output above is wrong, enter the WirePlumber sink ID now."
-  read -rp "Default sink ID from wpctl status [blank]: " SET_SINK_ID
+  echo "For speaker output, use an ID from SPEAKER OUTPUTS / PipeWire Sinks only."
+  echo "Do NOT use Audio > Devices, Sources, Video, or microphone IDs."
+  read -rp "Speaker sink ID to force [blank = keep auto/default]: " SET_SINK_ID
 fi
 if [[ -n "$SET_SINK_ID" && -S "${USER_RUNTIME}/bus" ]]; then
   run_as_user "wpctl set-default '${SET_SINK_ID}' || true"
@@ -324,19 +530,31 @@ sudo -u "$CURRENT_USER" .venv/bin/python -m pip install \
   -f 'https://synesthesiam.github.io/prebuilt-apps/' \
   -e .
 
-log "Audio device discovery"
-echo "Microphone devices from arecord -L:"
-arecord -L || true
+log "Wyoming microphone selection"
+AUTO_MIC="$(/usr/local/bin/room-mic-auto || true)"
+if [[ -n "$AUTO_MIC" ]]; then
+  echo "Auto-detected likely ReSpeaker/USB mic:"
+  echo "  ${AUTO_MIC}"
+else
+  echo "No obvious ReSpeaker/USB mic auto-detected."
+fi
 echo
-echo "PipeWire/WirePlumber status:"
-if [[ -S "${USER_RUNTIME}/bus" ]]; then run_as_user 'wpctl status || true'; fi
+/usr/local/bin/room-audio-ls || true
 
 if [[ -z "$MIC_DEVICE" && "$NONINTERACTIVE" != "1" ]]; then
   echo
-  echo "For USB ReSpeaker, look for ArrayUAC10, ReSpeaker, seeed, or plughw:CARD=...,DEV=0."
-  read -rp "Mic ALSA device for Wyoming [default]: " MIC_DEVICE
+  echo "For the Wyoming mic, use a full ALSA string from MICROPHONES, usually plughw:CARD=...,DEV=0."
+  echo "Do NOT enter the numeric PipeWire speaker sink ID here."
+  if [[ -n "$AUTO_MIC" ]]; then
+    read -rp "Mic ALSA device for Wyoming [${AUTO_MIC}]: " MIC_DEVICE
+    MIC_DEVICE="${MIC_DEVICE:-$AUTO_MIC}"
+  else
+    read -rp "Mic ALSA device for Wyoming [default]: " MIC_DEVICE
+    MIC_DEVICE="${MIC_DEVICE:-default}"
+  fi
+elif [[ -z "$MIC_DEVICE" ]]; then
+  MIC_DEVICE="${AUTO_MIC:-default}"
 fi
-MIC_DEVICE="${MIC_DEVICE:-default}"
 
 log "Create Wyoming I/O wrappers"
 sudo tee /usr/local/bin/wyoming-room-snd >/dev/null <<'WYOSND_EOF'
@@ -559,11 +777,20 @@ echo
 echo "=== throttling / undervoltage ==="
 vcgencmd get_throttled 2>/dev/null || true
 echo
-echo "=== ALSA capture devices ==="
+echo "=== clean audio summary ==="
+/usr/local/bin/room-audio-ls 2>/dev/null || true
+echo
+echo "=== ALSA capture devices - full raw list ==="
 arecord -L || true
 echo
-echo "=== ALSA playback devices ==="
+echo "=== ALSA playback devices - full raw list ==="
 aplay -L || true
+echo
+echo "=== ALSA cards ==="
+aplay -l || true
+echo
+echo "=== InnoMaker/Merus boot config ==="
+grep -nE "merus-amp|dtparam=audio=off" /boot/firmware/config.txt /boot/config.txt 2>/dev/null || true
 echo
 echo "=== PipeWire status ==="
 sudo -u "\${USER_NAME}" XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR}" DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS}" wpctl status || true
@@ -579,6 +806,7 @@ sudo chmod +x /usr/local/bin/room-node-diag
 sudo tee /etc/room-node.conf >/dev/null <<CONF_EOF
 ROOM_NAME="${ROOM_NAME}"
 ROOM_SAFE="${ROOM_SAFE}"
+CONFIGURE_INNOMAKER_HAT="${CONFIGURE_INNOMAKER_HAT}"
 HA_HOST="${HA_HOST}"
 MIC_DEVICE="${MIC_DEVICE}"
 DUCK_LEVEL="${DUCK_LEVEL}"
@@ -592,10 +820,10 @@ log "Enable and start user services"
 if [[ -S "${USER_RUNTIME}/bus" ]]; then
   userctl daemon-reload || true
   userctl enable --now pipewire.service pipewire-pulse.service wireplumber.service || true
-  userctl enable spotify-connect.service snapclient-room.service wyoming-satellite-room.service room-ducker.service || true
+  userctl enable room-audio-default.service spotify-connect.service snapclient-room.service wyoming-satellite-room.service room-ducker.service || true
   if [[ "$INSTALL_AIRPLAY" == "1" ]]; then userctl enable shairport-sync-user.service || true; fi
   userctl stop snapclient-room.service >/dev/null 2>&1 || true
-  userctl restart spotify-connect.service wyoming-satellite-room.service room-ducker.service || true
+  userctl restart room-audio-default.service spotify-connect.service wyoming-satellite-room.service room-ducker.service || true
   if [[ "$INSTALL_AIRPLAY" == "1" ]]; then userctl restart shairport-sync-user.service || true; fi
 else
   echo "WARNING: user bus unavailable; reboot, then run: audio-mode status"
@@ -613,6 +841,7 @@ echo "  audio-mode multiroom     # Snapcast grouped playback mode"
 echo "  audio-mode airplay       # AirPlay only"
 echo "  audio-mode all           # allow all sources to mix"
 echo "  audio-mode status"
+echo "  room-audio-default      # retry setting default sink to the Merus/InnoMaker HAT"
 echo "  room-node-diag"
 echo
 echo "Home Assistant: Settings -> Devices & services -> add/accept Wyoming Protocol for this satellite."
