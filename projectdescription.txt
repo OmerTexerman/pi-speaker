@@ -1,0 +1,4 @@
+Rpi 3B+ with rasberry pi OS Lite 64 bit
+
+respeaker usb 4 mic array
+Innomaker audio amplifier: https://www.inno-maker.com/product/hifi-amp-pro/ 
