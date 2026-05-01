@@ -11,7 +11,7 @@ set -euo pipefail
 #   - User-service Wyoming Satellite for Home Assistant Assist
 #   - User-service ducking daemon that lowers music while Wyoming TTS is speaking
 
-SCRIPT_VERSION="2026-05-01.2"
+SCRIPT_VERSION="2026-05-01.3-no-local-vad"
 
 ROOM_NAME=""
 HA_HOST=""
@@ -303,18 +303,26 @@ SHAIRPORT_EOF
   rm -f /tmp/shairport-sync-user.service
 fi
 
-log "Install Wyoming Satellite"
+log "Install Wyoming Satellite (basic satellite only, no local VAD/noise extras)"
+# Important: do NOT install wyoming-satellite[all] on Raspberry Pi OS Trixie/Python 3.13.
+# The optional local VAD/noise stack can pull old numpy wheels and fail. Your HA server
+# is doing wake word/STT/TTS anyway, so this room node only needs the basic satellite.
 cd "$USER_HOME"
-if [[ ! -d "${USER_HOME}/wyoming-satellite" ]]; then
+if [[ ! -d "${USER_HOME}/wyoming-satellite/.git" ]]; then
+  rm -rf "${USER_HOME}/wyoming-satellite"
   sudo -u "$CURRENT_USER" git clone https://github.com/rhasspy/wyoming-satellite.git "${USER_HOME}/wyoming-satellite"
 else
   sudo -u "$CURRENT_USER" bash -lc "cd '${USER_HOME}/wyoming-satellite' && git pull --ff-only || true"
 fi
 cd "${USER_HOME}/wyoming-satellite"
+# Remove any failed venv from a previous run that tried to build numpy/pysilero.
+sudo -u "$CURRENT_USER" rm -rf .venv
 sudo -u "$CURRENT_USER" python3 -m venv .venv
-sudo -u "$CURRENT_USER" .venv/bin/pip install --upgrade pip wheel setuptools
-sudo -u "$CURRENT_USER" bash -lc "cd '${USER_HOME}/wyoming-satellite' && script/setup" || \
-  sudo -u "$CURRENT_USER" bash -lc "cd '${USER_HOME}/wyoming-satellite' && .venv/bin/pip install -f 'https://synesthesiam.github.io/prebuilt-apps/' -e '.[all]'"
+sudo -u "$CURRENT_USER" .venv/bin/python -m pip install --upgrade pip wheel setuptools
+sudo -u "$CURRENT_USER" .venv/bin/python -m pip install \
+  --extra-index-url 'https://www.piwheels.org/simple' \
+  -f 'https://synesthesiam.github.io/prebuilt-apps/' \
+  -e .
 
 log "Audio device discovery"
 echo "Microphone devices from arecord -L:"
